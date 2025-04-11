@@ -111,15 +111,19 @@ impl ScalarUDFImpl for RegexpExtractFunc {
         &self,
         args: datafusion_expr::ScalarFunctionArgs,
     ) -> Result<ColumnarValue> {
+
         let args = &args.args;
+
+        // Find the length of the first array
         let len = args
             .iter()
-            .fold(Option::<usize>::None, |acc, arg| match arg {
-                ColumnarValue::Scalar(_) => acc,
+            .find_map(|arg| match arg {
                 ColumnarValue::Array(a) => Some(a.len()),
+                _ => None,
             });
 
         let is_scalar = len.is_none();
+
         let inferred_length = len.unwrap_or(1);
         let args = args
             .iter()
