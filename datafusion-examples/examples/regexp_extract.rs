@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ctx.register_batch("t", batch)?;
 
     let df = ctx
-        .sql("SELECT a, regexp_match(a, '(a.*d)', 'i'), b FROM t")
+        .sql("SELECT a, regexp_extract(a, '(a.*d)', 'i'), b FROM t")
         .await?;
 
     df.show().await?;
