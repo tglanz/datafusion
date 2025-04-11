@@ -16,17 +16,15 @@
 // under the License.
 
 //! Regex expressions
-use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::compute::kernels::regexp;
+use arrow::array::{Array, ArrayRef, GenericStringArray, Int64Array, OffsetSizeTrait, StringBuilder};
 use arrow::datatypes::DataType;
-use arrow::datatypes::Field;
-use datafusion_common::exec_err;
-use datafusion_common::ScalarValue;
-use datafusion_common::{arrow_datafusion_err, plan_err};
+use datafusion_common::cast::{as_int64_array, as_large_string_array, as_string_array};
+use datafusion_common::{exec_err, ScalarValue};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{ColumnarValue, Documentation, TypeSignature};
 use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
 use datafusion_macros::user_doc;
+use regex::Regex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -37,34 +35,31 @@ use std::sync::Arc;
     sql_example = r#"```sql
             > select regexp_extract('Köln', '[a-zA-Z]ö[a-zA-Z]{2}');
             +---------------------------------------------------------+
-            | regexp_extract(Utf8("Köln"),Utf8("[a-zA-Z]ö[a-zA-Z]{2}")) |
+            | regexp_extract(Utf8("Köln"), Utf8("[a-zA-Z]ö[a-zA-Z]{2}"), 1) |
             +---------------------------------------------------------+
             | [Köln]                                                  |
             +---------------------------------------------------------+
-            SELECT regexp_extract('aBc', '(b|d)', 'i');
+            SELECT regexp_extract('aBc', '(b|d)', 1);
             +---------------------------------------------------+
-            | regexp_extract(Utf8("aBc"),Utf8("(b|d)"),Utf8("i")) |
+            | regexp_extract(Utf8("aBc"), Utf8("(b|d)"), 1) |
             +---------------------------------------------------+
             | [B]                                               |
             +---------------------------------------------------+
 ```
-Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp.rs)
+Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp_extract.rs)
 "#,
     standard_argument(name = "str", prefix = "String"),
     argument(
         name = "regexp",
         description = "Regular expression to match against.
-            Can be a constant, column, or function."
+            Can be a constant or column."
     ),
     argument(
-        name = "flags",
-        description = r#"Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
-  - **i**: case-insensitive: letters match both upper and lower case
-  - **m**: multi-line mode: ^ and $ match begin/end of line
-  - **s**: allow . to match \n
-  - **R**: enables CRLF mode: when multi-line mode is enabled, \r\n is used
-  - **U**: swap the meaning of x* and x*?"#
-    )
+        name = "group index",
+        description = "A one-based index to the matching group to extract.
+            If 0 is provided, will retrieve the full match.
+            Must be a constant, or column."
+    ),
 )]
 #[derive(Debug)]
 pub struct RegexpExtractFunc {
@@ -83,15 +78,10 @@ impl RegexpExtractFunc {
         Self {
             signature: Signature::one_of(
                 vec![
-                    // Planner attempts coercion to the target type starting with the most preferred candidate.
-                    // For example, given input `(Utf8View, Utf8)`, it first tries coercing to `(Utf8View, Utf8View)`.
-                    // If that fails, it proceeds to `(Utf8, Utf8)`.
-                    TypeSignature::Exact(vec![Utf8View, Utf8View]),
-                    TypeSignature::Exact(vec![Utf8, Utf8]),
-                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8]),
-                    TypeSignature::Exact(vec![Utf8View, Utf8View, Utf8View]),
-                    TypeSignature::Exact(vec![Utf8, Utf8, Utf8]),
-                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, LargeUtf8]),
+                    // input, pattern, index
+                    // TypeSignature::Exact(vec![Utf8View, Utf8View, Int64]), // TBD
+                    TypeSignature::Exact(vec![Utf8, Utf8, Int64]),
+                    TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int64]),
                 ],
                 Volatility::Immutable,
             ),
@@ -113,10 +103,8 @@ impl ScalarUDFImpl for RegexpExtractFunc {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(match &arg_types[0] {
-            DataType::Null => DataType::Null,
-            other => DataType::List(Arc::new(Field::new_list_field(other.clone(), true))),
-        })
+        // Same as input
+        Ok(arg_types[0].clone())
     }
 
     fn invoke_with_args(
@@ -138,13 +126,13 @@ impl ScalarUDFImpl for RegexpExtractFunc {
             .map(|arg| arg.to_array(inferred_length))
             .collect::<Result<Vec<_>>>()?;
 
-        let result = regexp_extract(&args);
+        let result = regexp_extract(&args)?;
+
         if is_scalar {
-            // If all inputs are scalar, keeps output as scalar
-            let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
-            result.map(ColumnarValue::Scalar)
+            let scalar_value = ScalarValue::try_from_array(&result, 0)?;
+            Ok(ColumnarValue::Scalar(scalar_value))
         } else {
-            result.map(ColumnarValue::Array)
+            Ok(ColumnarValue::Array(result))
         }
     }
 
@@ -153,109 +141,132 @@ impl ScalarUDFImpl for RegexpExtractFunc {
     }
 }
 
-pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
-    match args.len() {
-        2 => {
-            // Arrow regexp matching
-            regexp::regexp_match(&args[0], &args[1], None)
-                .map_err(|e| arrow_datafusion_err!(e))
-        }
-        3 => {
-            match args[2].data_type() {
-                DataType::Utf8View => {
-                    if args[2].as_string_view().iter().any(|s| s == Some("g")) {
-                        return plan_err!("regexp_extract() does not support the \"global\" option");
-                    }
-                }
-                DataType::Utf8 => {
-                    if args[2].as_string::<i32>().iter().any(|s| s == Some("g")) {
-                        return plan_err!("regexp_extract() does not support the \"global\" option");
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    if args[2].as_string::<i64>().iter().any(|s| s == Some("g")) {
-                        return plan_err!("regexp_extract() does not support the \"global\" option");
-                    }
-                }
-                e => {
-                    return plan_err!("regexp_extract was called with unexpected data type {e:?}");
+fn concrete_regexp_extract<T: OffsetSizeTrait>(
+    string_array: &GenericStringArray<T>,
+    pattern_array: &GenericStringArray<T>,
+    group_index_array: &Int64Array,
+) -> Result<ArrayRef> {
+    let mut builder = StringBuilder::with_capacity(
+        // We know the extact number of entries
+        string_array.len(),
+        // We even know an upper bound of the memory size since regex matching will yield substrings at most
+        string_array.get_buffer_memory_size(),
+    );
+
+    // If it's a scalar we would like to compile the pattern only once.
+    let scalar_regex = if pattern_array.len() == 1 {
+        Some(
+            Regex::new(pattern_array.value(0))
+                .map_err(|_| DataFusionError::Execution(
+                    format!("Unable to compile pattern '{}' into regex", pattern_array.value(0))))?
+        )
+    } else {
+        None
+    };
+    
+    for i in 0..string_array.len() {
+        let group_index = if group_index_array.len() == 1 {
+            group_index_array.value(0)
+        } else {
+            group_index_array.value(i)
+        } as usize;
+
+        let current_regex = match &scalar_regex {
+            Some(scalar_regex) => scalar_regex,
+            None => {
+                &Regex::new(pattern_array.value(i))
+                    .map_err(|_| DataFusionError::Execution(
+                        format!("Unable to compile pattern '{}' into regex", pattern_array.value(i))))?
+            }
+        };
+
+        let input = string_array.value(i);
+
+        match current_regex.captures(input) {
+            Some(captures) => {
+                if group_index < captures.len() {
+                    builder.append_value(captures.get(group_index).map(|m| m.as_str()).unwrap_or(""));
+                } else {
+                    builder.append_value("");
                 }
             }
-
-            // Arrow regexp matching
-            regexp::regexp_match(&args[0], &args[1], Some(&args[2]))
-                .map_err(|e| arrow_datafusion_err!(e))
+            None => builder.append_value(""),
         }
-        other => exec_err!(
-            "regexp_extract was called with {other} arguments. It requires at least 2 and at most 3."
-        ),
+    }
+
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+
+}
+
+pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let input_array = &args[0];
+    let pattern_array = &args[1];
+    let group_index_array = as_int64_array(&args[2])?;
+
+    match input_array.data_type() {
+        DataType::Utf8 => concrete_regexp_extract(
+            as_string_array(input_array)
+                .map_err(|_| DataFusionError::Execution("Failed to downcast input array to string array".into()))?,
+            as_string_array(pattern_array)
+                .map_err(|_| DataFusionError::Execution("Failed to downcast pattern array to string array".into()))?,
+            group_index_array),
+        DataType::LargeUtf8 => concrete_regexp_extract(
+            as_large_string_array(input_array)
+                .map_err(|_| DataFusionError::Execution("Failed to downcast input array to large string array".into()))?,
+            as_large_string_array(pattern_array)
+                .map_err(|_| DataFusionError::Execution("Failed to downcast pattern array to large string array".into()))?,
+            group_index_array),
+        _ => exec_err!("Unsupported input type: {}", input_array.data_type())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use crate::regex::regexpextract::regexp_extract;
-    use arrow::array::StringArray;
-    use arrow::array::{GenericStringBuilder, ListBuilder};
+    use arrow::array::{Array, Int64Array, StringArray, StringBuilder};
     use std::sync::Arc;
 
     #[test]
     fn test_case_sensitive_regexp_extract() {
-        let values = StringArray::from(vec!["abc"; 5]);
-        let patterns =
-            StringArray::from(vec!["^(a)", "^(A)", "(b|d)", "(B|D)", "^(b|c)"]);
+        let values = StringArray::from(vec!["axb_cyd_ezf"; 5]);
 
-        let elem_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
-        let mut expected_builder = ListBuilder::new(elem_builder);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        expected_builder.append(false);
-        let expected = expected_builder.finish();
+        let patterns = StringArray::from(vec![
+            "(a.*?b).*(c.*?d).*(e.*f)",
+            "(a.*?b).*(c.*?d).*(e.*f)",
+            "(a.*?b)",
+            "(c.*?d)",
+            "nomatch",
+        ]);
 
-        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns)]).unwrap();
+        let group_indices = Int64Array::from(vec![
+            0,
+            2,
+            2,
+            1,
+            0,
+        ]);
 
-        assert_eq!(re.as_ref(), &expected);
-    }
+        let expected = {
+            let mut expected_builder = StringBuilder::with_capacity(
+                values.len(),
+                values.get_buffer_memory_size(),
+            );
+            expected_builder.append_value("axb_cyd_ezf");
+            expected_builder.append_value("cyd");
+            expected_builder.append_value("");
+            expected_builder.append_value("cyd");
+            expected_builder.append_value("");
+            expected_builder.finish()
+        };
 
-    #[test]
-    fn test_case_insensitive_regexp_extract() {
-        let values = StringArray::from(vec!["abc"; 5]);
-        let patterns =
-            StringArray::from(vec!["^(a)", "^(A)", "(b|d)", "(B|D)", "^(b|c)"]);
-        let flags = StringArray::from(vec!["i"; 5]);
+        let actual = regexp_extract(&[
+            Arc::new(values),
+            Arc::new(patterns),
+            Arc::new(group_indices),
+        ]).unwrap();
 
-        let elem_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
-        let mut expected_builder = ListBuilder::new(elem_builder);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        let expected = expected_builder.finish();
+        println!("{:?}", actual);
 
-        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(flags)])
-            .unwrap();
-
-        assert_eq!(re.as_ref(), &expected);
-    }
-
-    #[test]
-    fn test_unsupported_global_flag_regexp_extract() {
-        let values = StringArray::from(vec!["abc"]);
-        let patterns = StringArray::from(vec!["^(a)"]);
-        let flags = StringArray::from(vec!["g"]);
-
-        let re_err =
-            regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(flags)])
-                .expect_err("unsupported flag should have failed");
-
-        assert_eq!(re_err.strip_backtrace(), "Error during planning: regexp_extract() does not support the \"global\" option");
+        assert_eq!(actual.as_ref(), &expected);
     }
 }

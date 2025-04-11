@@ -896,3 +896,65 @@ drop table strings
 
 statement ok
 drop table dict_table
+
+#
+# regexp_extract tests
+#
+
+# all arrays 
+statement ok
+CREATE TABLE t_extract(string varchar, pattern varchar, group_index int) AS VALUES
+    ('somejunk', 'nomatch', 1),
+    ('somejunk', 'nomatch', 2),
+    ('somejunk', 'nomatch', 3),
+    ('somejunk', 'nomatch', 0),
+    ('---axxxbcyyydezzzf+++', '(a.*?b).*(c.*?d).*(e.*?f)', 1),
+    ('---axxxbcyyydezzzf+++', '(a.*?b).*(c.*?d).*(e.*?f)', 2),
+    ('---axxxbcyyydezzzf+++', '(a.*?b).*(c.*?d).*(e.*?f)', 3),
+    ('---axxxbcyyydezzzf+++', '(a.*?b).*(c.*?d).*(e.*?f)', 0),
+    ('---axxxbcyyydezzzf+++', '(c.*?d)', 1),
+    ('---axxxbcyyydezzzf+++', '(c.*?d)', 2),
+    ('---axxxbcyyydezzzf+++', '(c.*?d)', 3),
+    ('---axxxbcyyydezzzf+++', '(c.*?d)', 0);
+
+query TTI
+SELECT string, regexp_extract(string, pattern, group_index), group_index
+FROM t_extract
+;
+----
+somejunk (empty) 1
+somejunk (empty) 2
+somejunk (empty) 3
+somejunk (empty) 0
+---axxxbcyyydezzzf+++ axxxb 1
+---axxxbcyyydezzzf+++ cyyyd 2
+---axxxbcyyydezzzf+++ ezzzf 3
+---axxxbcyyydezzzf+++ axxxbcyyydezzzf 0
+---axxxbcyyydezzzf+++ cyyyd 1
+---axxxbcyyydezzzf+++ (empty) 2
+---axxxbcyyydezzzf+++ (empty) 3
+---axxxbcyyydezzzf+++ cyyyd 0
+
+# type coercion
+statement ok
+SELECT regexp_extract(arrow_cast(string, 'Utf8'), arrow_cast(pattern, 'LargeUtf8'),  arrow_cast(group_index, 'Int32')) from t_extract;
+
+statement ok
+DROP TABLE t_extract;
+
+# scalars
+statement ok
+CREATE TABLE t_extract(string varchar) AS VALUES
+    ('somejunk'),
+    ('---axxxbcyyydezzzf+++');
+
+query T
+SELECT regexp_extract(string, '(a.*?b)', 1)
+FROM t_extract
+;
+----
+(empty)
+axxxb
+
+statement ok
+DROP TABLE t_extract;
