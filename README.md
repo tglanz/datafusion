@@ -89,6 +89,8 @@ Some relevant algorithms are from the sketch family of algorithms:
 2. [Hyper log log](https://en.wikipedia.org/wiki/HyperLogLog) - Approximates the number of distinct items
 3. [t-digest](https://github.com/tdunning/t-digest/blob/main/README.md) - Approximates the quantuiles of a data set
 
+> Note: this is also not from spark itself but from previous work and academy
+
 We can further optimize the group by, by providing a native implementation.
 
 ## References
